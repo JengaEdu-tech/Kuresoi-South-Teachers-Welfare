@@ -1,0 +1,237 @@
+-- Kuresoi South Teachers Welfare Group
+-- Run once in Supabase SQL Editor on a NEW project after reviewing.
+create extension if not exists pgcrypto;
+
+create type public.school_level as enum ('ECDE','Primary','Junior School','Secondary');
+create type public.school_status as enum ('pending','approved','rejected','suspended');
+create type public.member_role as enum ('teacher','school_admin','county_admin','welfare_admin','super_admin');
+create type public.fundraiser_status as enum ('draft','active','closed','cancelled');
+create type public.payment_status as enum ('pending','paid','failed','cancelled','reversed');
+
+create table public.profiles (
+ id uuid primary key references auth.users(id) on delete cascade,
+ full_name text not null,
+ phone text,
+ role public.member_role not null default 'teacher',
+ school_id uuid,
+ show_name_on_public_reports boolean not null default false,
+ created_at timestamptz not null default now(),
+ updated_at timestamptz not null default now()
+);
+
+create table public.schools (
+ id uuid primary key default gen_random_uuid(),
+ name text not null,
+ county text not null,
+ sub_county text,
+ level public.school_level not null,
+ status public.school_status not null default 'pending',
+ created_by uuid not null references auth.users(id),
+ approved_by uuid references auth.users(id),
+ approved_at timestamptz,
+ created_at timestamptz not null default now(),
+ unique (name, county, level)
+);
+
+alter table public.profiles add constraint profiles_school_fk foreign key (school_id) references public.schools(id) on delete set null;
+
+create table public.school_memberships (
+ id uuid primary key default gen_random_uuid(),
+ school_id uuid not null references public.schools(id) on delete cascade,
+ user_id uuid not null references public.profiles(id) on delete cascade,
+ position_title text not null default 'Teacher',
+ membership_status text not null default 'active' check (membership_status in ('pending','active','left')),
+ joined_at timestamptz not null default now(),
+ unique(school_id,user_id)
+);
+
+create table public.school_officials (
+ id uuid primary key default gen_random_uuid(),
+ school_id uuid not null references public.schools(id) on delete cascade,
+ position_title text not null check(position_title in ('Headteacher','Deputy Headteacher','Principal','Deputy Principal','Other')),
+ full_name text not null,
+ updated_by uuid references auth.users(id),
+ updated_at timestamptz not null default now(),
+ unique(school_id,position_title)
+);
+
+create table public.fundraisers (
+ id uuid primary key default gen_random_uuid(),
+ title text not null,
+ mission text not null,
+ beneficiary_names text,
+ target_amount numeric(12,2),
+ default_amount numeric(12,2) not null default 200 check(default_amount > 0),
+ status public.fundraiser_status not null default 'draft',
+ opens_at timestamptz not null default now(),
+ closes_at timestamptz,
+ created_by uuid not null references auth.users(id),
+ created_at timestamptz not null default now()
+);
+
+create table public.school_targets (
+ id uuid primary key default gen_random_uuid(),
+ fundraiser_id uuid not null references public.fundraisers(id) on delete cascade,
+ school_id uuid not null references public.schools(id) on delete cascade,
+ amount_per_teacher numeric(12,2) check(amount_per_teacher is null or amount_per_teacher > 0),
+ school_target numeric(12,2) check(school_target is null or school_target >= 0),
+ unique(fundraiser_id,school_id)
+);
+
+-- Contributions are created by the secure Edge Function; browser users cannot mark themselves paid.
+create table public.contributions (
+ id uuid primary key default gen_random_uuid(),
+ fundraiser_id uuid not null references public.fundraisers(id),
+ school_id uuid not null references public.schools(id),
+ user_id uuid not null references public.profiles(id),
+ amount numeric(12,2) not null check(amount > 0),
+ phone text not null,
+ public_name_consent boolean not null default false,
+ payment_status public.payment_status not null default 'pending',
+ checkout_request_id text unique,
+ merchant_request_id text,
+ mpesa_receipt_number text unique,
+ result_code text,
+ result_description text,
+ paid_at timestamptz,
+ created_at timestamptz not null default now()
+);
+
+-- Shared school teacher directory. It can include teachers before they create an online account.
+-- Every active member of the same school can add, edit or remove directory entries.
+create table public.school_teachers (
+ id uuid primary key default gen_random_uuid(),
+ school_id uuid not null references public.schools(id) on delete cascade,
+ full_name text not null check(length(trim(full_name)) between 2 and 140),
+ phone text,
+ position_title text not null default 'Teacher',
+ institution_section text not null check(institution_section in ('ECDE','Primary','Junior School','Secondary')),
+ linked_user_id uuid references public.profiles(id) on delete set null,
+ added_by uuid not null references auth.users(id),
+ created_at timestamptz not null default now(),
+ updated_at timestamptz not null default now()
+);
+
+create index school_teachers_school_name_idx on public.school_teachers(school_id, full_name);
+
+create table public.audit_logs (
+ id bigint generated always as identity primary key,
+ actor_id uuid references auth.users(id),
+ action text not null,
+ table_name text not null,
+ record_id text,
+ details jsonb not null default '{}'::jsonb,
+ created_at timestamptz not null default now()
+);
+
+create index schools_status_name_idx on public.schools(status,name);
+create index memberships_user_idx on public.school_memberships(user_id);
+create index memberships_school_idx on public.school_memberships(school_id);
+create index contributions_fundraiser_school_idx on public.contributions(fundraiser_id,school_id);
+create index contributions_status_idx on public.contributions(payment_status);
+create index contributions_user_idx on public.contributions(user_id);
+
+-- New accounts get a profile. Role always defaults to teacher; user metadata cannot grant admin roles.
+create or replace function public.handle_new_user()
+returns trigger language plpgsql security definer set search_path=''
+as $$
+begin
+ insert into public.profiles(id,full_name)
+ values(new.id, coalesce(nullif(new.raw_user_meta_data->>'full_name',''),'Teacher'));
+ return new;
+end;
+$$;
+create trigger on_auth_user_created after insert on auth.users
+for each row execute procedure public.handle_new_user();
+
+-- Helpers read trusted database role values, not editable user metadata.
+create or replace function public.has_role(allowed public.member_role[])
+returns boolean language sql stable security definer set search_path=''
+as $$
+ select exists(select 1 from public.profiles p where p.id=auth.uid() and p.role=any(allowed));
+$$;
+
+create or replace function public.is_school_member(target_school uuid)
+returns boolean language sql stable security definer set search_path=''
+as $$
+ select exists(select 1 from public.school_memberships m where m.school_id=target_school and m.user_id=auth.uid() and m.membership_status='active');
+$$;
+
+alter table public.profiles enable row level security;
+alter table public.schools enable row level security;
+alter table public.school_memberships enable row level security;
+alter table public.school_officials enable row level security;
+alter table public.school_teachers enable row level security;
+alter table public.fundraisers enable row level security;
+alter table public.school_targets enable row level security;
+alter table public.contributions enable row level security;
+alter table public.audit_logs enable row level security;
+
+-- Explicit grants: public may read only approved schools and active fundraisers.
+revoke all on public.profiles,public.schools,public.school_memberships,public.school_officials,public.school_teachers,public.fundraisers,public.school_targets,public.contributions,public.audit_logs from anon,authenticated;
+grant select on public.schools,public.fundraisers,public.school_targets to anon,authenticated;
+grant select,update on public.profiles to authenticated;
+grant select,insert on public.schools to authenticated;
+grant update(status) on public.schools to authenticated;
+grant select,insert,update on public.school_memberships to authenticated;
+grant select,insert,update on public.school_officials to authenticated;
+grant select,insert,update,delete on public.school_teachers to authenticated;
+grant select on public.contributions to authenticated,anon;
+grant select on public.audit_logs to authenticated;
+
+create policy "Public can see approved schools" on public.schools for select to anon,authenticated using(status='approved');
+create policy "Any signed-in user can add a school" on public.schools for insert to authenticated
+with check(status='approved' and created_by=auth.uid());
+create policy "Any signed-in user can remove a school from directory" on public.schools for update to authenticated
+using(status='approved') with check(status='suspended');
+create policy "Admins manage schools" on public.schools for all to authenticated using(public.has_role(array['super_admin','welfare_admin']::public.member_role[])) with check(public.has_role(array['super_admin','welfare_admin']::public.member_role[]));
+
+create policy "Users read own profile" on public.profiles for select to authenticated using(id=auth.uid() or public.has_role(array['super_admin','welfare_admin','county_admin']::public.member_role[]));
+create policy "Users update own profile" on public.profiles for update to authenticated using(id=auth.uid()) with check(id=auth.uid());
+create policy "Welfare admins read profiles" on public.profiles for select to authenticated using(public.has_role(array['super_admin','welfare_admin','county_admin']::public.member_role[]));
+
+create policy "School members see memberships" on public.school_memberships for select to authenticated
+using(user_id=auth.uid() or public.is_school_member(school_id) or public.has_role(array['super_admin','welfare_admin','county_admin']::public.member_role[]));
+
+-- Any signed-in teacher may join an already-approved school. No school administrator approval is needed.
+create policy "Teachers join approved schools" on public.school_memberships for insert to authenticated
+with check(
+  user_id=auth.uid()
+  and membership_status='active'
+  and exists(select 1 from public.schools s where s.id=school_id and s.status='approved')
+);
+
+-- Every active member can update/remove another teacher's school membership.
+create policy "Any school member manages memberships" on public.school_memberships for update to authenticated
+using(public.is_school_member(school_id))
+with check(public.is_school_member(school_id));
+
+create policy "Any school member removes memberships" on public.school_memberships for delete to authenticated
+using(public.is_school_member(school_id));
+
+create policy "School members read teacher directory" on public.school_teachers for select to authenticated
+using(public.is_school_member(school_id) or public.has_role(array['super_admin','welfare_admin','county_admin']::public.member_role[]));
+create policy "Any school member adds teachers" on public.school_teachers for insert to authenticated
+with check(public.is_school_member(school_id) and added_by=auth.uid());
+create policy "Any school member edits teachers" on public.school_teachers for update to authenticated
+using(public.is_school_member(school_id)) with check(public.is_school_member(school_id));
+create policy "Any school member removes teachers" on public.school_teachers for delete to authenticated
+using(public.is_school_member(school_id));
+
+create policy "Approved school officials public" on public.school_officials for select to anon,authenticated using(exists(select 1 from public.schools s where s.id=school_id and s.status='approved'));
+create policy "Authorized school leaders edit officials" on public.school_officials for all to authenticated using(public.is_school_member(school_id) and public.has_role(array['school_admin','super_admin','welfare_admin']::public.member_role[])) with check(public.is_school_member(school_id) and public.has_role(array['school_admin','super_admin','welfare_admin']::public.member_role[]));
+
+create policy "Public sees active fundraisers" on public.fundraisers for select to anon,authenticated using(status='active');
+create policy "Welfare admins manage fundraisers" on public.fundraisers for all to authenticated using(public.has_role(array['super_admin','welfare_admin']::public.member_role[])) with check(public.has_role(array['super_admin','welfare_admin']::public.member_role[]));
+create policy "Public sees targets for active fundraisers" on public.school_targets for select to anon,authenticated using(exists(select 1 from public.fundraisers f where f.id=fundraiser_id and f.status='active'));
+create policy "Welfare admins manage targets" on public.school_targets for all to authenticated using(public.has_role(array['super_admin','welfare_admin']::public.member_role[])) with check(public.has_role(array['super_admin','welfare_admin']::public.member_role[]));
+
+-- Public contribution summaries should be implemented through a carefully scoped, consent-aware view/RPC.
+-- Raw contribution rows are not readable by anonymous users in this starter.
+create policy "Teachers see own contributions" on public.contributions for select to authenticated using(user_id=auth.uid() or public.has_role(array['super_admin','welfare_admin','county_admin']::public.member_role[]));
+create policy "Admins read audit logs" on public.audit_logs for select to authenticated using(public.has_role(array['super_admin','welfare_admin']::public.member_role[]));
+
+-- IMPORTANT FIRST ADMIN SETUP:
+-- After signing up your own account, run this using its auth.users UUID:
+-- update public.profiles set role='super_admin' where id='YOUR-AUTH-USER-UUID';
+-- Do not expose this privilege through the website.
