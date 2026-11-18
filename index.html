@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#123b32">
+  <title>Kuresoi South Teachers Welfare Group</title>
+  <link rel="stylesheet" href="style.css">
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="#"><span class="brand-mark">TW</span><span>Kuresoi South <small>Teachers Welfare Group</small></span></a>
+    <nav><a href="#fundraisers">Fundraisers</a><a href="#schools">Schools</a><button id="authButton" class="btn btn-light">Sign in</button></nav>
+  </header>
+  <main>
+    <section class="hero">
+      <div class="hero-copy">
+        <span class="eyebrow">ONE TEACHER COMMUNITY • MANY SCHOOLS</span>
+        <h1>Standing together<br><em>when it matters.</em></h1>
+        <p>A transparent, simple platform for teachers to support colleagues, families and welfare causes across our schools.</p>
+        <div class="hero-actions"><a class="btn btn-primary" href="#fundraisers">View fundraisers</a><button class="btn btn-outline" id="joinSchoolBtn">Add a school</button></div>
+      </div>
+      <div class="hero-art"><div class="art-circle">🤝</div><div class="art-card"><b>One community</b><span>Support • Solidarity • Accountability</span></div></div>
+    </section>
+
+    <section class="stats">
+      <article><span>Active fundraisers</span><strong id="statFundraisers">—</strong></article>
+      <article><span>Approved schools</span><strong id="statSchools">—</strong></article>
+      <article><span>Total contributions</span><strong id="statTotal">KSh —</strong></article>
+    </section>
+
+    <section class="section" id="fundraisers">
+      <div class="section-head"><div><span class="eyebrow">COMMUNITY SUPPORT</span><h2>Current fundraisers</h2></div><span class="muted">Open to view • Sign in to contribute</span></div>
+      <div id="fundraiserList" class="cards"><div class="empty">Connect Supabase to load live fundraisers.</div></div>
+    </section>
+
+    <section class="section" id="schools">
+      <div class="section-head"><div><span class="eyebrow">OUR NETWORK</span><h2>Find your school</h2></div></div>
+      <div class="search-row"><input id="schoolSearch" placeholder="Search approved schools..." aria-label="Search schools"><button class="btn btn-primary" id="searchSchoolsBtn">Search</button></div>
+      <div id="schoolList" class="school-list"><div class="empty">Approved schools will appear here.</div></div>
+    </section>
+
+
+    <section class="section" id="teacher-directory">
+      <div class="section-head">
+        <div><span class="eyebrow">SCHOOL MANAGEMENT</span><h2>Shared teacher directory</h2></div>
+      </div>
+      <p class="muted">Sign in and join a school to view and manage its shared teacher list.</p>
+      <div class="form">
+        <label>Your school
+          <select id="directorySchool"><option value="">Sign in and join a school first</option></select>
+        </label>
+        <button class="btn btn-outline" id="loadDirectoryBtn" type="button">Load teacher list</button>
+      </div>
+      <form id="teacherAddForm" class="form">
+        <label>Teacher's full name<input id="directoryTeacherName" required maxlength="140"></label>
+        <label>Phone number (optional)<input id="directoryTeacherPhone" type="tel"></label>
+        <label>Position<input id="directoryTeacherPosition" value="Teacher" required></label>
+        <label>Institution section
+          <select id="directoryTeacherSection" required>
+            <option value="ECDE">ECDE</option>
+            <option value="Primary">Primary</option>
+            <option value="Junior School">Junior School</option>
+            <option value="Secondary">Secondary</option>
+          </select>
+        </label>
+        <button class="btn btn-primary" type="submit">Add teacher</button>
+      </form>
+      <p id="directoryMessage" class="message" aria-live="polite"></p>
+      <div id="teacherDirectoryList" class="school-list">
+        <div class="empty">Sign in and select your school to load teachers.</div>
+      </div>
+    </section>
+
+    <section class="callout">
+      <div><span class="eyebrow">ARE YOU A TEACHER?</span><h2>Join your school community.</h2><p>Create an account, find your school and keep your details up to date.</p></div>
+      <button class="btn btn-white" id="signupBtn">Create teacher account</button>
+    </section>
+  </main>
+  <footer><span>Kuresoi South Teachers Welfare Group</span><span>Built for solidarity and accountability</span></footer>
+
+  <dialog id="authDialog" class="modal">
+    <form method="dialog" class="modal-close"><button aria-label="Close">×</button></form>
+    <h2 id="authTitle">Sign in</h2>
+    <p class="muted">Use your email and password. Teacher accounts are created through this portal.</p>
+    <form id="authForm" class="form">
+      <label id="nameWrap" hidden>Full name<input id="fullName" autocomplete="name"></label>
+      <label>Email<input id="email" type="email" required autocomplete="email"></label>
+      <label>Password<input id="password" type="password" required minlength="8" autocomplete="current-password"></label>
+      <button class="btn btn-primary" id="authSubmit" type="submit">Sign in</button>
+      <button class="text-button" type="button" id="toggleAuth">Create an account</button>
+    </form>
+    <p id="authMessage" class="message" aria-live="polite"></p>
+  </dialog>
+
+  <dialog id="schoolDialog" class="modal">
+    <form method="dialog" class="modal-close"><button aria-label="Close">×</button></form>
+    <h2>Add a school</h2>
+    <p class="muted">Anyone with a teacher account can add a school. It will appear immediately in the directory.</p>
+    <form id="schoolForm" class="form">
+      <label>School name<input id="newSchoolName" required maxlength="160"></label>
+      <label>County<input id="newSchoolCounty" required maxlength="80"></label>
+      <label>Sub-county<input id="newSchoolSubcounty" maxlength="80"></label>
+      <label>Institution level<select id="newSchoolLevel" required><option value="">Choose level</option><option>ECDE</option><option>Primary</option><option>Junior School</option><option>Secondary</option></select></label>
+      <button class="btn btn-primary" type="submit">Add school</button>
+    </form>
+    <p id="schoolMessage" class="message" aria-live="polite"></p>
+  </dialog>
+
+  <dialog id="contributeDialog" class="modal">
+    <form method="dialog" class="modal-close"><button aria-label="Close">×</button></form>
+    <h2>Make a contribution</h2>
+    <p id="contributeDetails" class="muted"></p>
+    <form id="contributeForm" class="form">
+      <label>School<select id="contributeSchool" required></select></label>
+      <label>M-Pesa phone number<input id="mpesaPhone" type="tel" placeholder="07XXXXXXXX or 2547XXXXXXXX" required></label>
+      <label>Amount (KSh)<input id="contributeAmount" type="number" min="1" step="1" required></label>
+      <label class="consent"><input id="publicConsent" type="checkbox"> I agree that my name and contribution status may appear in this fundraiser's school report.</label>
+      <button class="btn btn-primary" type="submit">Send M-Pesa prompt</button>
+    </form>
+    <p id="paymentMessage" class="message" aria-live="polite"></p>
+  </dialog>
+  <div id="toast" role="status" class="toast"></div>
+  <script src="app.js"></script>
+</body>
+</html>
