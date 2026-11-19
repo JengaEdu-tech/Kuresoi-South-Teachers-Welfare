@@ -1,56 +1,41 @@
+import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
 
-import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
-
-/* ========================================= CORS AND RESPONSE HELPERS ========================================= */
-
-const cors = {
+const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Headers":
     "authorization, x-client-info, apikey, content-type",
   "Access-Control-Allow-Methods": "POST, OPTIONS",
 };
 
-function json(body: unknown, status = 200) {
-  return new Response(JSON.stringify(body), {
+function response(data: unknown, status = 200) {
+  return new Response(JSON.stringify(data), {
     status,
-    headers: {
-      ...cors,
-      "Content-Type": "application/json",
-    },
+    headers: { ...corsHeaders, "Content-Type": "application/json" },
   });
 }
 
-const env = (key: string) => Deno.env.get(key) || "";
-
-function logError(stage: string, error: unknown) {
-  console.error(stage, {
-    message: error instanceof Error ? error.message : String(error),
-  });
+function getEnv(name: string): string {
+  const value = Deno.env.get(name);
+  if (!value) throw new Error(`Missing Supabase secret: ${name}`);
+  return value;
 }
 
-/* ========================================= PHONE NUMBER NORMALIZATION ========================================= */
+function normalizePhone(value: string): string {
+  let phone = value.replace(/[\s+()-]/g, "");
 
-function normalizePhone(raw: string) {
-  let phone = raw.replace(/[^\d]/g, "");
-
-  if (phone.startsWith("0")) {
-    phone = "254" + phone.slice(1);
-  } else if (phone.startsWith("7") || phone.startsWith("1")) {
+  if (phone.startsWith("0")) phone = "254" + phone.slice(1);
+  if (phone.startsWith("7") || phone.startsWith("1")) {
     phone = "254" + phone;
   }
 
-  if (!/^254[17]\d{8}$/.test(phone)) {
-    throw new Error(
-      "Enter a valid Kenyan mobile number, e.g. 0712345678."
-    );
+  if (!/^254[71]\d{8}$/.test(phone)) {
+    throw new Error("Enter a valid Kenyan M-Pesa phone number.");
   }
 
   return phone;
 }
 
-/* ========================================= NAIROBI TIMESTAMP ========================================= */
-
-function timestamp() {
+function getNairobiTimestamp(): string {
   const parts = new Intl.DateTimeFormat("en-GB", {
     timeZone: "Africa/Nairobi",
     year: "numeric",
@@ -63,11 +48,8 @@ function timestamp() {
   }).formatToParts(new Date());
 
   const values: Record<string, string> = {};
-
   for (const part of parts) {
-    if (part.type !== "literal") {
-      values[part.type] = part.value;
-    }
+    values[part.type] = part.value;
   }
 
   return (
@@ -80,520 +62,254 @@ function timestamp() {
   );
 }
 
-/* ========================================= DARAJA CONFIGURATION ========================================= */
+async function saveTransaction(data: Record<string, unknown>) {
+  const supabaseUrl = getEnv("SUPABASE_URL");
+  const serviceKey = getEnv("SUPABASE_SERVICE_ROLE_KEY");
 
-function getDarajaConfig() {
-  const environment = env("DARAJA_ENV").trim().toLowerCase();
+  const result = await fetch(
+    `${supabaseUrl}/rest/v1/mpesa_transactions?on_conflict=checkout_request_id`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        apikey: serviceKey,
+        Authorization: `Bearer ${serviceKey}`,
+        Prefer: "resolution=merge-duplicates,return=minimal",
+      },
+      body: JSON.stringify(data),
+    },
+  );
 
-  if (environment !== "sandbox" && environment !== "production") {
-    throw new Error("DARAJA_ENV must be sandbox or production.");
+  if (!result.ok) {
+    throw new Error(`Transaction database error: ${await result.text()}`);
   }
-
-  const config = {
-    consumerKey: env("DARAJA_CONSUMER_KEY").trim(),
-    consumerSecret: env("DARAJA_CONSUMER_SECRET").trim(),
-    shortcode: env("DARAJA_SHORTCODE").trim(),
-    passkey: env("DARAJA_PASSKEY").trim(),
-    callbackUrl: env("DARAJA_CALLBACK_URL")
-      .trim()
-      .replace(/^["']|["']$/g, ""),
-    transactionType:
-      env("DARAJA_TRANSACTION_TYPE").trim() ||
-      "CustomerPayBillOnline",
-    environment,
-  };
-
-  const missing = [];
-
-  if (!config.consumerKey) missing.push("DARAJA_CONSUMER_KEY");
-  if (!config.consumerSecret) missing.push("DARAJA_CONSUMER_SECRET");
-  if (!config.shortcode) missing.push("DARAJA_SHORTCODE");
-  if (!config.passkey) missing.push("DARAJA_PASSKEY");
-  if (!config.callbackUrl) missing.push("DARAJA_CALLBACK_URL");
-
-  if (missing.length) {
-    throw new Error(
-      "Missing M-Pesa configuration: " + missing.join(", ")
-    );
-  }
-
-  /* Validate callback URL */
-
-  let callback: URL;
-
-  try {
-    callback = new URL(config.callbackUrl);
-  } catch {
-    throw new Error(
-      "DARAJA_CALLBACK_URL is not a valid URL. Check Supabase Secrets."
-    );
-  }
-
-  if (
-    callback.protocol !== "https:" ||
-    callback.hostname !== "saubnyqwfwysldoenfmx.supabase.co" ||
-    callback.pathname !== "/functions/v1/mpesa-callback"
-  ) {
-    throw new Error(
-      "DARAJA_CALLBACK_URL must be your public Supabase HTTPS callback URL."
-    );
-  }
-
-  console.log("STK: Configuration validated", {
-    consumerKey: !!config.consumerKey,
-    consumerSecret: !!config.consumerSecret,
-    shortcode: !!config.shortcode,
-    passkey: !!config.passkey,
-    callbackUrl: callback.origin + callback.pathname,
-    environment,
-  });
-
-  return config;
 }
 
-/* ========================================= SAFE HTTP RESPONSE READER ========================================= */
+async function handleCallback(body: any) {
+  const callback = body?.Body?.stkCallback;
 
-async function readResponse(response: Response) {
-  const text = await response.text();
+  if (!callback) {
+    return response({ error: "Invalid M-Pesa callback." }, 400);
+  }
+
+  const items = callback.CallbackMetadata?.Item || [];
+  const metadata: Record<string, unknown> = {};
+
+  for (const item of items) {
+    metadata[item.Name] = item.Value;
+  }
+
+  const successful = Number(callback.ResultCode) === 0;
 
   try {
-    return JSON.parse(text);
-  } catch {
-    console.error("Provider returned invalid response", {
-      status: response.status,
+    await saveTransaction({
+      checkout_request_id: callback.CheckoutRequestID,
+      merchant_request_id: callback.MerchantRequestID || null,
+      result_code: Number(callback.ResultCode),
+      result_description: callback.ResultDesc || "",
+      status: successful ? "SUCCESS" : "FAILED",
+      mpesa_receipt_number:
+        metadata.MpesaReceiptNumber?.toString() || null,
+      amount: metadata.Amount ?? null,
+      phone_number: metadata.PhoneNumber?.toString() || null,
+      transaction_date: metadata.TransactionDate?.toString() || null,
+      updated_at: new Date().toISOString(),
     });
 
-    throw new Error("Payment provider returned an invalid response.");
+    return response({ ResultCode: 0, ResultDesc: "Accepted" });
+  } catch (error) {
+    console.error("Callback saving error:", error);
+    return response({ ResultCode: 0, ResultDesc: "Received" });
   }
 }
 
-/* ========================================= DARAJA ACCESS TOKEN ========================================= */
+async function verifyUser(req: Request): Promise<boolean> {
+  const authorization = req.headers.get("Authorization");
 
-async function darajaToken( config: ReturnType<typeof getDarajaConfig> ) {
-  const base =
-    config.environment === "production"
+  if (!authorization?.startsWith("Bearer ")) return false;
+
+  const supabaseUrl = getEnv("SUPABASE_URL");
+  const anonKey = getEnv("SUPABASE_ANON_KEY");
+
+  const result = await fetch(`${supabaseUrl}/auth/v1/user`, {
+    headers: {
+      apikey: anonKey,
+      Authorization: authorization,
+    },
+  });
+
+  return result.ok;
+}
+
+async function initiateSTKPush(req: Request) {
+  // Only authenticated school users may initiate payments.
+  if (!(await verifyUser(req))) {
+    return response(
+      { success: false, error: "Please sign in before initiating payment." },
+      401,
+    );
+  }
+
+  const body = await req.json();
+
+  const phone = normalizePhone(String(body.phone || body.phoneNumber || ""));
+  const amount = Number(body.amount);
+
+  if (!Number.isSafeInteger(amount) || amount < 1) {
+    return response(
+      { success: false, error: "Enter a valid payment amount." },
+      400,
+    );
+  }
+
+  const accountReference = String(
+    body.accountReference || body.admissionNumber || "SCHOOLFEES",
+  ).replace(/[^a-zA-Z0-9]/g, "").slice(0, 12);
+
+  const description = String(
+    body.transactionDesc || "School Fees",
+  ).slice(0, 13);
+
+  const consumerKey = getEnv("MPESA_CONSUMER_KEY");
+  const consumerSecret = getEnv("MPESA_CONSUMER_SECRET");
+  const shortcode = getEnv("MPESA_SHORTCODE");
+  const passkey = getEnv("MPESA_PASSKEY");
+
+  const environment = Deno.env.get("MPESA_ENV") || "sandbox";
+
+  const baseUrl =
+    environment === "production"
       ? "https://api.safaricom.co.ke"
       : "https://sandbox.safaricom.co.ke";
 
-  const credentials = btoa(
-    `${config.consumerKey}:${config.consumerSecret}`
-  );
+  const callbackUrl =
+    Deno.env.get("MPESA_CALLBACK_URL") ||
+    `${getEnv("SUPABASE_URL")}/functions/v1/start-stk-push`;
 
-  const response = await fetch(
-    `${base}/oauth/v1/generate?grant_type=client_credentials`,
+  const timestamp = getNairobiTimestamp();
+
+  // Generate Daraja STK password.
+  const password = btoa(shortcode + passkey + timestamp);
+
+  // Obtain Daraja access token.
+  const tokenResponse = await fetch(
+    `${baseUrl}/oauth/v1/generate?grant_type=client_credentials`,
     {
-      method: "GET",
       headers: {
-        Authorization: `Basic ${credentials}`,
+        Authorization:
+          "Basic " + btoa(consumerKey + ":" + consumerSecret),
       },
-    }
+    },
   );
 
-  const result = await readResponse(response);
+  const tokenData = await tokenResponse.json();
 
-  console.log("STK: Daraja authentication", {
-    httpStatus: response.status,
-    authenticated: !!result.access_token,
-    errorCode: result.errorCode || null,
-  });
+  if (!tokenResponse.ok || !tokenData.access_token) {
+    console.error("Daraja authentication failed:", tokenData);
 
-  if (!response.ok || !result.access_token) {
-    throw new Error(
-      "Unable to authenticate with M-Pesa. Check your Daraja credentials."
+    return response(
+      { success: false, error: "Could not authenticate with M-Pesa." },
+      502,
     );
   }
 
-  return {
-    token: result.access_token as string,
-    base,
-  };
+  // Initiate STK Push.
+  const stkResponse = await fetch(
+    `${baseUrl}/mpesa/stkpush/v1/processrequest`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${tokenData.access_token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        BusinessShortCode: shortcode,
+        Password: password,
+        Timestamp: timestamp,
+        TransactionType: "CustomerPayBillOnline",
+        Amount: amount,
+        PartyA: phone,
+        PartyB: shortcode,
+        PhoneNumber: phone,
+        CallBackURL: callbackUrl,
+        AccountReference: accountReference,
+        TransactionDesc: description,
+      }),
+    },
+  );
+
+  const stkData = await stkResponse.json();
+
+  if (!stkResponse.ok || stkData.ResponseCode !== "0") {
+    console.error("STK Push error:", stkData);
+
+    return response(
+      {
+        success: false,
+        error: stkData.errorMessage ||
+          stkData.ResponseDescription ||
+          "M-Pesa STK Push failed.",
+        details: stkData,
+      },
+      502,
+    );
+  }
+
+  // Record the pending payment.
+  try {
+    await saveTransaction({
+      checkout_request_id: stkData.CheckoutRequestID,
+      merchant_request_id: stkData.MerchantRequestID,
+      phone_number: phone,
+      amount,
+      account_reference: accountReference,
+      result_code: null,
+      result_description: "STK Push initiated",
+      status: "PENDING",
+      created_at: new Date().toISOString(),
+    });
+  } catch (error) {
+    console.error("Could not save pending transaction:", error);
+  }
+
+  return response({
+    success: true,
+    message: "STK Push sent successfully. Check your phone.",
+    checkoutRequestID: stkData.CheckoutRequestID,
+    merchantRequestID: stkData.MerchantRequestID,
+    customerMessage: stkData.CustomerMessage,
+  });
 }
 
-/* ========================================= MAIN EDGE FUNCTION ========================================= */
-
-Deno.serve(async (req: Request) => {
+serve(async (req: Request) => {
   if (req.method === "OPTIONS") {
-    return new Response("ok", { headers: cors });
+    return new Response("ok", { headers: corsHeaders });
   }
 
   if (req.method !== "POST") {
-    return json({ error: "Method not allowed." }, 405);
+    return response({ error: "Method not allowed." }, 405);
   }
 
   try {
-    console.log("STK: New payment request received");
+    const body = await req.clone().json();
 
-    /* 1. SUPABASE CONFIGURATION */
-
-    const supabaseUrl = env("SUPABASE_URL");
-    const supabaseAnonKey = env("SUPABASE_ANON_KEY");
-    const serviceRoleKey = env("SUPABASE_SERVICE_ROLE_KEY");
-
-    if (!supabaseUrl || !supabaseAnonKey || !serviceRoleKey) {
-      return json({
-        error: "Server configuration is incomplete.",
-      }, 500);
+    // Safaricom sends callbacks without a Supabase login token.
+    if (body?.Body?.stkCallback) {
+      return await handleCallback(body);
     }
 
-    /* 2. AUTHENTICATE USER */
-
-    const authorization = req.headers.get("Authorization");
-
-    if (!authorization) {
-      return json({ error: "Please sign in first." }, 401);
-    }
-
-    const userClient = createClient(
-      supabaseUrl,
-      supabaseAnonKey,
-      {
-        global: {
-          headers: { Authorization: authorization },
-        },
-      }
-    );
-
-    const {
-      data: { user },
-      error: userError,
-    } = await userClient.auth.getUser();
-
-    if (userError || !user) {
-      return json({
-        error: "Invalid or expired session.",
-      }, 401);
-    }
-
-    /* 3. ADMIN CLIENT */
-
-    const admin = createClient(
-      supabaseUrl,
-      serviceRoleKey,
-      {
-        auth: {
-          persistSession: false,
-          autoRefreshToken: false,
-        },
-      }
-    );
-
-    /* 4. READ REQUEST */
-
-    let body: Record<string, unknown>;
-
-    try {
-      const parsed = await req.json();
-
-      if (
-        !parsed ||
-        typeof parsed !== "object" ||
-        Array.isArray(parsed)
-      ) {
-        return json({ error: "Invalid payment request." }, 400);
-      }
-
-      body = parsed;
-    } catch {
-      return json({ error: "Invalid JSON request." }, 400);
-    }
-
-    const rawAmount = Number(body.amount);
-
-    if (
-      typeof body.fundraiser_id !== "string" ||
-      !body.fundraiser_id ||
-      typeof body.school_id !== "string" ||
-      !body.school_id ||
-      !Number.isSafeInteger(rawAmount) ||
-      rawAmount < 1 ||
-      rawAmount > 150000
-    ) {
-      return json({
-        error: "Check fundraiser, school and amount. Amount must be between KES 1 and KES 150,000.",
-      }, 400);
-    }
-
-    const amount = rawAmount;
-
-    let phone: string;
-
-    try {
-      phone = normalizePhone(String(body.phone || ""));
-    } catch (error) {
-      return json({
-        error: error instanceof Error
-          ? error.message
-          : "Invalid phone number.",
-      }, 400);
-    }
-
-    /* 5. VERIFY FUNDRAISER */
-
-    const { data: fund, error: fundError } = await admin
-      .from("fundraisers")
-      .select("id,status,default_amount,closes_at")
-      .eq("id", body.fundraiser_id)
-      .maybeSingle();
-
-    if (fundError) {
-      logError("Fundraiser lookup failed", fundError);
-
-      return json({
-        error: "Unable to verify fundraiser.",
-      }, 500);
-    }
-
-    if (
-      !fund ||
-      fund.status !== "active" ||
-      (fund.closes_at && new Date(fund.closes_at) < new Date())
-    ) {
-      return json({
-        error: "This fundraiser is not open.",
-      }, 400);
-    }
-
-    /* 6. VERIFY SCHOOL */
-
-    const { data: school, error: schoolError } = await admin
-      .from("schools")
-      .select("id,status")
-      .eq("id", body.school_id)
-      .maybeSingle();
-
-    if (schoolError) {
-      logError("School lookup failed", schoolError);
-
-      return json({
-        error: "Unable to verify school.",
-      }, 500);
-    }
-
-    if (!school || school.status !== "approved") {
-      return json({
-        error: "Choose an approved school.",
-      }, 400);
-    }
-
-    /* 7. VERIFY SCHOOL MEMBERSHIP */
-
-    const { data: membership, error: membershipError } = await admin
-      .from("school_memberships")
-      .select("id")
-      .eq("school_id", body.school_id)
-      .eq("user_id", user.id)
-      .eq("membership_status", "active")
-      .maybeSingle();
-
-    if (membershipError) {
-      logError("Membership lookup failed", membershipError);
-
-      return json({
-        error: "Unable to verify school membership.",
-      }, 500);
-    }
-
-    const { data: profile, error: profileError } = await admin
-      .from("profiles")
-      .select("school_id")
-      .eq("id", user.id)
-      .maybeSingle();
-
-    if (profileError) {
-      logError("Profile lookup failed", profileError);
-
-      return json({
-        error: "Unable to verify your profile.",
-      }, 500);
-    }
-
-    if (!membership && profile?.school_id !== body.school_id) {
-      return json({
-        error: "Join this school before contributing.",
-      }, 403);
-    }
-
-    /* 8. VALIDATE DARAJA CONFIGURATION */
-
-    let config: ReturnType<typeof getDarajaConfig>;
-
-    try {
-      config = getDarajaConfig();
-    } catch (error) {
-      logError("STK configuration error", error);
-
-      return json({
-        error: error instanceof Error
-          ? error.message
-          : "M-Pesa configuration error.",
-      }, 500);
-    }
-
-    /* 9. GENERATE ACCESS TOKEN */
-
-    let tokenData: Awaited<ReturnType<typeof darajaToken>>;
-
-    try {
-      tokenData = await darajaToken(config);
-    } catch (error) {
-      logError("Token generation failed", error);
-
-      return json({
-        error: error instanceof Error
-          ? error.message
-          : "M-Pesa authentication failed.",
-      }, 502);
-    }
-
-    /* 10. CREATE CONTRIBUTION */
-
-    const { data: contribution, error: insertError } = await admin
-      .from("contributions")
-      .insert({
-        fundraiser_id: body.fundraiser_id,
-        school_id: body.school_id,
-        user_id: user.id,
-        amount,
-        phone,
-        public_name_consent: body.public_name_consent === true,
-        payment_status: "pending",
-      })
-      .select("id")
-      .single();
-
-    if (insertError || !contribution) {
-      logError("Contribution insertion failed", insertError);
-
-      return json({
-        error: "Unable to create contribution record.",
-      }, 500);
-    }
-
-    const contributionId = contribution.id;
-
-    /* 11. PREPARE STK PUSH */
-
-    const ts = timestamp();
-
-    const password = btoa(
-      `${config.shortcode}${config.passkey}${ts}`
-    );
-
-    const payload = {
-      BusinessShortCode: config.shortcode,
-      Password: password,
-      Timestamp: ts,
-      TransactionType: config.transactionType,
-      Amount: amount,
-      PartyA: phone,
-      PartyB: config.shortcode,
-      PhoneNumber: phone,
-      CallBackURL: config.callbackUrl,
-      AccountReference: "TEACHER-WELFARE",
-      TransactionDesc: "Welfare contribution",
-    };
-
-    console.log("STK: Sending request to Safaricom", {
-      amount,
-      environment: config.environment,
-      transactionType: config.transactionType,
-    });
-
-    /* 12. SEND STK PUSH */
-
-    const response = await fetch(
-      `${tokenData.base}/mpesa/stkpush/v1/processrequest`,
-      {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${tokenData.token}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(payload),
-      }
-    );
-
-    const result = await readResponse(response);
-
-    console.log("STK: Safaricom response", {
-      httpStatus: response.status,
-      responseCode: result.ResponseCode ?? null,
-      responseDescription: result.ResponseDescription ?? null,
-      errorCode: result.errorCode ?? null,
-      errorMessage: result.errorMessage ?? null,
-    });
-
-    /* 13. HANDLE FAILED PAYMENT REQUEST */
-
-    if (!response.ok || String(result.ResponseCode) !== "0") {
-      const failureMessage =
-        result.errorMessage ||
-        result.ResponseDescription ||
-        "M-Pesa rejected the payment request.";
-
-      const { error: updateError } = await admin
-        .from("contributions")
-        .update({
-          payment_status: "failed",
-          result_description: String(failureMessage).slice(0, 500),
-        })
-        .eq("id", contributionId);
-
-      if (updateError) {
-        logError("Failed to update contribution", updateError);
-      }
-
-      return json({
-        error: failureMessage,
-        paymentStatus: "failed",
-      }, 400);
-    }
-
-    /* 14. VERIFY CHECKOUT REFERENCES */
-
-    if (!result.CheckoutRequestID || !result.MerchantRequestID) {
-      return json({
-        error: "M-Pesa response did not include checkout identifiers.",
-      }, 502);
-    }
-
-    /* 15. SAVE CHECKOUT REFERENCES */
-
-    const { error: updateError } = await admin
-      .from("contributions")
-      .update({
-        checkout_request_id: result.CheckoutRequestID,
-        merchant_request_id: result.MerchantRequestID,
-      })
-      .eq("id", contributionId);
-
-    if (updateError) {
-      logError("Unable to save checkout identifiers", updateError);
-
-      return json({
-        error: "Payment prompt may have been sent, but its reference could not be saved. Contact support before retrying.",
-      }, 500);
-    }
-
-    /* 16. SUCCESS */
-
-    console.log("STK: Payment prompt successfully initiated", {
-      contributionId,
-      checkoutRequestId: result.CheckoutRequestID,
-    });
-
-    return json({
-      ok: true,
-      contributionId,
-      customerMessage:
-        "M-Pesa prompt sent. Enter your M-Pesa PIN to complete payment.",
-    });
-
+    return await initiateSTKPush(req);
   } catch (error) {
-    logError("Unexpected STK function error", error);
+    console.error("STK Push function error:", error);
 
-    return json({
-      error: "An unexpected payment error occurred. Please try again later.",
-    }, 500);
+    return response(
+      {
+        success: false,
+        error: error instanceof Error
+          ? error.message
+          : "An unexpected payment error occurred.",
+      },
+      500,
+    );
   }
 });
