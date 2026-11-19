@@ -1,5 +1,3 @@
-// Supabase Edge Function: authenticated STK Push initiation.
-// Configure secrets in Supabase Edge Function Secrets; never put them in app.js.
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
@@ -41,15 +39,13 @@ function normalizePhone(raw: string) {
 
   if (phone.startsWith("0")) {
     phone = "254" + phone.slice(1);
-  }
-
-  if (phone.startsWith("7") || phone.startsWith("1")) {
+  } else if (phone.startsWith("7") || phone.startsWith("1")) {
     phone = "254" + phone;
   }
 
   if (!/^254[17]\d{8}$/.test(phone)) {
     throw new Error(
-      "Enter a valid Kenyan Safaricom number, e.g. 0712345678."
+      "Enter a valid Kenyan mobile number, e.g. 0712345678."
     );
   }
 
@@ -58,7 +54,6 @@ function normalizePhone(raw: string) {
 
 /* =========================================
    NAIROBI TIMESTAMP
-   M-Pesa format: YYYYMMDDHHmmss
 ========================================= */
 
 function timestamp() {
@@ -96,22 +91,23 @@ function timestamp() {
 ========================================= */
 
 function getDarajaConfig() {
-  const environment = env("DARAJA_ENV").toLowerCase();
+  const environment = env("DARAJA_ENV").trim().toLowerCase();
 
   if (environment !== "sandbox" && environment !== "production") {
-    throw new Error(
-      "DARAJA_ENV must be sandbox or production."
-    );
+    throw new Error("DARAJA_ENV must be sandbox or production.");
   }
 
   const config = {
-    consumerKey: env("DARAJA_CONSUMER_KEY"),
-    consumerSecret: env("DARAJA_CONSUMER_SECRET"),
-    shortcode: env("DARAJA_SHORTCODE"),
-    passkey: env("DARAJA_PASSKEY"),
-    callbackUrl: env("DARAJA_CALLBACK_URL"),
+    consumerKey: env("DARAJA_CONSUMER_KEY").trim(),
+    consumerSecret: env("DARAJA_CONSUMER_SECRET").trim(),
+    shortcode: env("DARAJA_SHORTCODE").trim(),
+    passkey: env("DARAJA_PASSKEY").trim(),
+    callbackUrl: env("DARAJA_CALLBACK_URL")
+      .trim()
+      .replace(/^["']|["']$/g, ""),
     transactionType:
-      env("DARAJA_TRANSACTION_TYPE") || "CustomerPayBillOnline",
+      env("DARAJA_TRANSACTION_TYPE").trim() ||
+      "CustomerPayBillOnline",
     environment,
   };
 
@@ -129,26 +125,35 @@ function getDarajaConfig() {
     );
   }
 
-  try {
-    const callback = new URL(config.callbackUrl);
+  /* Validate callback URL */
 
-    if (callback.protocol !== "https:") {
-      throw new Error("HTTPS required");
-    }
+  let callback: URL;
+
+  try {
+    callback = new URL(config.callbackUrl);
   } catch {
     throw new Error(
-      "DARAJA_CALLBACK_URL must be a valid public HTTPS URL."
+      "DARAJA_CALLBACK_URL is not a valid URL. Check Supabase Secrets."
     );
   }
 
-  console.log("STK: Configuration check", {
-    consumerKey: true,
-    consumerSecret: true,
-    shortcode: true,
-    passkey: true,
-    callbackUrl: true,
+  if (
+    callback.protocol !== "https:" ||
+    callback.hostname !== "saubnyqwfwysldoenfmx.supabase.co" ||
+    callback.pathname !== "/functions/v1/mpesa-callback"
+  ) {
+    throw new Error(
+      "DARAJA_CALLBACK_URL must be your public Supabase HTTPS callback URL."
+    );
+  }
+
+  console.log("STK: Configuration validated", {
+    consumerKey: !!config.consumerKey,
+    consumerSecret: !!config.consumerSecret,
+    shortcode: !!config.shortcode,
+    passkey: !!config.passkey,
+    callbackUrl: callback.origin + callback.pathname,
     environment,
-    transactionType: config.transactionType,
   });
 
   return config;
@@ -164,7 +169,7 @@ async function readResponse(response: Response) {
   try {
     return JSON.parse(text);
   } catch {
-    console.error("STK: Provider returned non-JSON response", {
+    console.error("Provider returned invalid response", {
       status: response.status,
     });
 
@@ -176,7 +181,9 @@ async function readResponse(response: Response) {
    DARAJA ACCESS TOKEN
 ========================================= */
 
-async function darajaToken(config: ReturnType<typeof getDarajaConfig>) {
+async function darajaToken(
+  config: ReturnType<typeof getDarajaConfig>
+) {
   const base =
     config.environment === "production"
       ? "https://api.safaricom.co.ke"
@@ -206,7 +213,7 @@ async function darajaToken(config: ReturnType<typeof getDarajaConfig>) {
 
   if (!response.ok || !result.access_token) {
     throw new Error(
-      "Unable to authenticate with M-Pesa. Check your Sandbox Consumer Key and Consumer Secret."
+      "Unable to authenticate with M-Pesa. Check your Daraja credentials."
     );
   }
 
@@ -229,31 +236,22 @@ Deno.serve(async (req: Request) => {
     return json({ error: "Method not allowed." }, 405);
   }
 
-  let admin: ReturnType<typeof createClient> | null = null;
-  let contributionId: string | null = null;
-
   try {
     console.log("STK: New payment request received");
 
-    /* -------------------------------------
-       1. CHECK SUPABASE CONFIGURATION
-    ------------------------------------- */
+    /* 1. SUPABASE CONFIGURATION */
 
     const supabaseUrl = env("SUPABASE_URL");
     const supabaseAnonKey = env("SUPABASE_ANON_KEY");
     const serviceRoleKey = env("SUPABASE_SERVICE_ROLE_KEY");
 
     if (!supabaseUrl || !supabaseAnonKey || !serviceRoleKey) {
-      console.error("STK: Missing Supabase environment configuration");
-
       return json({
         error: "Server configuration is incomplete.",
       }, 500);
     }
 
-    /* -------------------------------------
-       2. VERIFY AUTHENTICATED USER
-    ------------------------------------- */
+    /* 2. AUTHENTICATE USER */
 
     const authorization = req.headers.get("Authorization");
 
@@ -266,9 +264,7 @@ Deno.serve(async (req: Request) => {
       supabaseAnonKey,
       {
         global: {
-          headers: {
-            Authorization: authorization,
-          },
+          headers: { Authorization: authorization },
         },
       }
     );
@@ -279,30 +275,36 @@ Deno.serve(async (req: Request) => {
     } = await userClient.auth.getUser();
 
     if (userError || !user) {
-      console.error("STK: User authentication failed");
-
-      return json({ error: "Invalid or expired session." }, 401);
+      return json({
+        error: "Invalid or expired session.",
+      }, 401);
     }
 
-    /* -------------------------------------
-       3. CREATE ADMIN CLIENT
-    ------------------------------------- */
+    /* 3. ADMIN CLIENT */
 
-    admin = createClient(
+    const admin = createClient(
       supabaseUrl,
-      serviceRoleKey
+      serviceRoleKey,
+      {
+        auth: {
+          persistSession: false,
+          autoRefreshToken: false,
+        },
+      }
     );
 
-    /* -------------------------------------
-       4. READ AND VALIDATE REQUEST
-    ------------------------------------- */
+    /* 4. READ REQUEST */
 
     let body: Record<string, unknown>;
 
     try {
       const parsed = await req.json();
 
-      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      if (
+        !parsed ||
+        typeof parsed !== "object" ||
+        Array.isArray(parsed)
+      ) {
         return json({ error: "Invalid payment request." }, 400);
       }
 
@@ -312,13 +314,6 @@ Deno.serve(async (req: Request) => {
     }
 
     const rawAmount = Number(body.amount);
-
-    console.log("STK: Request validation", {
-      hasFundraiser: !!body.fundraiser_id,
-      hasSchool: !!body.school_id,
-      hasPhone: !!body.phone,
-      amount: body.amount,
-    });
 
     if (
       typeof body.fundraiser_id !== "string" ||
@@ -330,7 +325,7 @@ Deno.serve(async (req: Request) => {
       rawAmount > 150000
     ) {
       return json({
-        error: "Check fundraiser, school and amount. Amount must be a whole number between KES 1 and KES 150,000.",
+        error: "Check fundraiser, school and amount. Amount must be between KES 1 and KES 150,000.",
       }, 400);
     }
 
@@ -348,9 +343,7 @@ Deno.serve(async (req: Request) => {
       }, 400);
     }
 
-    /* -------------------------------------
-       5. CHECK FUNDRAISER
-    ------------------------------------- */
+    /* 5. VERIFY FUNDRAISER */
 
     const { data: fund, error: fundError } = await admin
       .from("fundraisers")
@@ -359,10 +352,10 @@ Deno.serve(async (req: Request) => {
       .maybeSingle();
 
     if (fundError) {
-      logError("STK: Fundraiser database lookup failed", fundError);
+      logError("Fundraiser lookup failed", fundError);
 
       return json({
-        error: "Unable to verify fundraiser. Please try again.",
+        error: "Unable to verify fundraiser.",
       }, 500);
     }
 
@@ -376,9 +369,7 @@ Deno.serve(async (req: Request) => {
       }, 400);
     }
 
-    /* -------------------------------------
-       6. CHECK SCHOOL
-    ------------------------------------- */
+    /* 6. VERIFY SCHOOL */
 
     const { data: school, error: schoolError } = await admin
       .from("schools")
@@ -387,10 +378,10 @@ Deno.serve(async (req: Request) => {
       .maybeSingle();
 
     if (schoolError) {
-      logError("STK: School database lookup failed", schoolError);
+      logError("School lookup failed", schoolError);
 
       return json({
-        error: "Unable to verify school. Please try again.",
+        error: "Unable to verify school.",
       }, 500);
     }
 
@@ -400,9 +391,7 @@ Deno.serve(async (req: Request) => {
       }, 400);
     }
 
-    /* -------------------------------------
-       7. CHECK SCHOOL MEMBERSHIP
-    ------------------------------------- */
+    /* 7. VERIFY SCHOOL MEMBERSHIP */
 
     const { data: membership, error: membershipError } = await admin
       .from("school_memberships")
@@ -413,7 +402,7 @@ Deno.serve(async (req: Request) => {
       .maybeSingle();
 
     if (membershipError) {
-      logError("STK: Membership lookup failed", membershipError);
+      logError("Membership lookup failed", membershipError);
 
       return json({
         error: "Unable to verify school membership.",
@@ -427,7 +416,7 @@ Deno.serve(async (req: Request) => {
       .maybeSingle();
 
     if (profileError) {
-      logError("STK: Profile lookup failed", profileError);
+      logError("Profile lookup failed", profileError);
 
       return json({
         error: "Unable to verify your profile.",
@@ -440,16 +429,14 @@ Deno.serve(async (req: Request) => {
       }, 403);
     }
 
-    /* -------------------------------------
-       8. CHECK DARAJA CONFIGURATION
-    ------------------------------------- */
+    /* 8. VALIDATE DARAJA CONFIGURATION */
 
     let config: ReturnType<typeof getDarajaConfig>;
 
     try {
       config = getDarajaConfig();
     } catch (error) {
-      logError("STK: Configuration error", error);
+      logError("STK configuration error", error);
 
       return json({
         error: error instanceof Error
@@ -458,16 +445,14 @@ Deno.serve(async (req: Request) => {
       }, 500);
     }
 
-    /* -------------------------------------
-       9. GENERATE ACCESS TOKEN
-    ------------------------------------- */
+    /* 9. GENERATE ACCESS TOKEN */
 
     let tokenData: Awaited<ReturnType<typeof darajaToken>>;
 
     try {
       tokenData = await darajaToken(config);
     } catch (error) {
-      logError("STK: Token generation failed", error);
+      logError("Token generation failed", error);
 
       return json({
         error: error instanceof Error
@@ -476,9 +461,7 @@ Deno.serve(async (req: Request) => {
       }, 502);
     }
 
-    /* -------------------------------------
-       10. CREATE CONTRIBUTION RECORD
-    ------------------------------------- */
+    /* 10. CREATE CONTRIBUTION */
 
     const { data: contribution, error: insertError } = await admin
       .from("contributions")
@@ -495,18 +478,16 @@ Deno.serve(async (req: Request) => {
       .single();
 
     if (insertError || !contribution) {
-      logError("STK: Contribution insertion failed", insertError);
+      logError("Contribution insertion failed", insertError);
 
       return json({
         error: "Unable to create contribution record.",
       }, 500);
     }
 
-    contributionId = contribution.id;
+    const contributionId = contribution.id;
 
-    /* -------------------------------------
-       11. PREPARE STK PUSH
-    ------------------------------------- */
+    /* 11. PREPARE STK PUSH */
 
     const ts = timestamp();
 
@@ -530,14 +511,11 @@ Deno.serve(async (req: Request) => {
 
     console.log("STK: Sending request to Safaricom", {
       amount,
-      timestamp: ts,
       environment: config.environment,
       transactionType: config.transactionType,
     });
 
-    /* -------------------------------------
-       12. SEND STK PUSH REQUEST
-    ------------------------------------- */
+    /* 12. SEND STK PUSH */
 
     const response = await fetch(
       `${tokenData.base}/mpesa/stkpush/v1/processrequest`,
@@ -561,9 +539,7 @@ Deno.serve(async (req: Request) => {
       errorMessage: result.errorMessage ?? null,
     });
 
-    /* -------------------------------------
-       13. HANDLE FAILED STK PUSH
-    ------------------------------------- */
+    /* 13. HANDLE FAILED PAYMENT REQUEST */
 
     if (!response.ok || String(result.ResponseCode) !== "0") {
       const failureMessage =
@@ -580,7 +556,7 @@ Deno.serve(async (req: Request) => {
         .eq("id", contributionId);
 
       if (updateError) {
-        logError("STK: Failed to update rejected contribution", updateError);
+        logError("Failed to update contribution", updateError);
       }
 
       return json({
@@ -589,17 +565,15 @@ Deno.serve(async (req: Request) => {
       }, 400);
     }
 
-    /* -------------------------------------
-       14. SAVE CHECKOUT REQUEST DETAILS
-    ------------------------------------- */
+    /* 14. VERIFY CHECKOUT REFERENCES */
 
     if (!result.CheckoutRequestID || !result.MerchantRequestID) {
-      console.error("STK: Missing checkout identifiers");
-
       return json({
-        error: "M-Pesa response did not include checkout identifiers. Check server logs.",
+        error: "M-Pesa response did not include checkout identifiers.",
       }, 502);
     }
+
+    /* 15. SAVE CHECKOUT REFERENCES */
 
     const { error: updateError } = await admin
       .from("contributions")
@@ -610,16 +584,14 @@ Deno.serve(async (req: Request) => {
       .eq("id", contributionId);
 
     if (updateError) {
-      logError("STK: Unable to save checkout identifiers", updateError);
+      logError("Unable to save checkout identifiers", updateError);
 
       return json({
         error: "Payment prompt may have been sent, but its reference could not be saved. Contact support before retrying.",
       }, 500);
     }
 
-    /* -------------------------------------
-       15. SUCCESS
-    ------------------------------------- */
+    /* 16. SUCCESS */
 
     console.log("STK: Payment prompt successfully initiated", {
       contributionId,
@@ -634,7 +606,7 @@ Deno.serve(async (req: Request) => {
     });
 
   } catch (error) {
-    logError("STK: Unexpected function error", error);
+    logError("Unexpected STK function error", error);
 
     return json({
       error: "An unexpected payment error occurred. Please try again later.",
